@@ -116,8 +116,10 @@ def get_model_size_mb(model):
 # ----------------------------
 # 6. 加载测试数据（保留 attention_mask！）
 # ----------------------------
-print("\nLoading wikitext FYP set (FYP[:200]) for evaluation...")
-test_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="FYP[:200]")
+
+print("\nLoading wikitext test set (test[:200]) for evaluation...")
+test_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test[:200]")
+
 test_dataset = test_dataset.filter(lambda x: len(x["text"].strip()) > 10)
 
 
@@ -140,7 +142,9 @@ test_loader = DataLoader(tokenized_test, batch_size=batch_size, shuffle=False)
 
 
 # ----------------------------
-# 7. ✅ 修复后的 PPL 计算（正确忽略 padding）
+
+# 7. 修复后的 PPL 计算（正确忽略 padding）
+
 # ----------------------------
 def compute_perplexity(model, dataloader, device):
     model.eval()

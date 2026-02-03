@@ -70,12 +70,9 @@ def get_model_size_mb(model):
 # ----------------------------
 # 4. 加载测试数据（保留 attention_mask！）
 # ----------------------------
-<<<<<<< HEAD
 
-print("\nLoading wikitext FYP set (test[:200]) for evaluation...")
-=======
 print("\nLoading wikitext test set (test[:200]) for evaluation...")
->>>>>>> 18f2478 (fix error in code)
+
 test_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test[:200]")
 
 test_dataset = test_dataset.filter(lambda x: len(x["text"].strip()) > 10)
@@ -212,7 +209,7 @@ print(f"  Original: {inference_speed_original:.2f} samples/sec")
 print(f"  Quantized: {inference_speed_quantized:.2f} samples/sec")
 print(f"  Speedup: {inference_speed_quantized / inference_speed_original:.2f}x")
 
-print(f"\n🎯 ACCURACY (Perplexity on wikitext FYP, lower is better):")
+print(f"\n🎯 ACCURACY (Perplexity on wikitext test, lower is better):")
 print(f"  Original: {accuracy_original:.2f}")
 print(f"  Quantized: {accuracy_quantized:.2f}")
 if accuracy_original > 0:

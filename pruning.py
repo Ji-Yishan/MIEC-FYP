@@ -250,7 +250,7 @@ print(f"  Original: {latency_orig:.2f} ms | {throughput_orig:.2f} samples/sec")
 print(f"  Pruned:   {latency_pruned:.2f} ms | {throughput_pruned:.2f} samples/sec")
 print(f"  Speedup:  {latency_orig / latency_pruned:.2f}x")
 
-print(f"\n🎯 ACCURACY (Perplexity on wikitext FYP):")
+print(f"\n🎯 ACCURACY (Perplexity on wikitext test):")
 print(f"  Original PPL: {ppl_original:.2f}")
 print(f"  Pruned   PPL: {ppl_pruned:.2f}")
 if ppl_original > 0:

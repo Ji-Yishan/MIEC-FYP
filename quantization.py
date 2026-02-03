@@ -70,8 +70,12 @@ def get_model_size_mb(model):
 # ----------------------------
 # 4. 加载测试数据（保留 attention_mask！）
 # ----------------------------
+<<<<<<< HEAD
 
 print("\nLoading wikitext FYP set (test[:200]) for evaluation...")
+=======
+print("\nLoading wikitext test set (test[:200]) for evaluation...")
+>>>>>>> 18f2478 (fix error in code)
 test_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test[:200]")
 
 test_dataset = test_dataset.filter(lambda x: len(x["text"].strip()) > 10)

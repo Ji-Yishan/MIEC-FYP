@@ -1,5 +1,4 @@
-# distill_cpu_fixed.py
-
+# distill_cpu_local.py
 import os
 import torch
 from torch.utils.data import DataLoader
@@ -9,78 +8,76 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
-from datasets import load_from_disk
+from datasets import load_dataset
 from tqdm import tqdm
-import time
-import math
+import bitsandbytes as bnb  # 仅 GPU 使用
 
 # ----------------------------
-# 配置
+# 配置（CPU 优化版）
 # ----------------------------
-MODEL_DIR = "./local_model/qwen1_5_0_5b"
-DATA_DIR = "./local_data"
-DATASET_PATH = os.path.join(DATA_DIR, "wikitext2_test200")
+LOCAL_MODEL_PATH = "./local_model/qwen1_5_0_5b"
+LOCAL_DATASET_PATH = "./local_data/wikitext2_test200.json"
 
-BATCH_SIZE = 2
-MAX_LENGTH = 128
+BATCH_SIZE = 1          # CPU 必须小 batch
+MAX_LENGTH = 64         # 缩短序列长度（原128 → 64）
 TEMPERATURE = 2.0
-ALPHA = 0.5  # 蒸馏损失权重：alpha * KL + (1 - alpha) * CE
+ALPHA = 0.5
 LEARNING_RATE = 5e-5
-EPOCHS = 3
+EPOCHS = 1              # 减少 epoch（原2 → 1）
 SEED = 42
 
 set_seed(SEED)
-device = torch.device("cpu")
+device = torch.device("cpu")  # 强制使用 CPU
 print(f"Using device: {device}")
 
 # ----------------------------
-# 加载 tokenizer 和 teacher 模型
+# 模型加载（CPU 安全）
 # ----------------------------
-print("Loading tokenizer and teacher model...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+print("Loading models from local path...")
+tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+# ⚠️ CPU 必须用 float32！
 teacher_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_DIR,
-    torch_dtype=torch.float32,
-    trust_remote_code=True
+    LOCAL_MODEL_PATH,
+    torch_dtype=torch.float32,  # 关键修改
+    trust_remote_code=True,
+    low_cpu_mem_usage=True
 ).to(device).eval()
 
-# ----------------------------
-# Student 模型（此处仍用同架构，仅用于演示蒸馏流程）
-# ----------------------------
 student_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_DIR,
-    torch_dtype=torch.float32,
-    trust_remote_code=True
+    LOCAL_MODEL_PATH,
+    torch_dtype=torch.float32,  # 关键修改
+    trust_remote_code=True,
+    low_cpu_mem_usage=True
 ).to(device)
-
 student_model.train()
 
 # ----------------------------
-# 加载本地数据集
+# 数据集加载
 # ----------------------------
-print("Loading local dataset...")
-raw_dataset = load_from_disk(DATASET_PATH)
+print(f"Loading dataset from {LOCAL_DATASET_PATH}...")
+raw_dataset = load_dataset(
+    "json",
+    data_files=LOCAL_DATASET_PATH,
+    split="train"
+)
 
 def tokenize_function(examples):
     return tokenizer(
         examples["text"],
         truncation=True,
         padding="max_length",
-        max_length=MAX_LENGTH,
-        return_special_tokens_mask=True
+        max_length=MAX_LENGTH,  # 使用缩短的长度
     )
 
 tokenized_ds = raw_dataset.map(
     tokenize_function,
     batched=True,
-    remove_columns=raw_dataset.column_names,
-    desc="Tokenizing"
+    remove_columns=["text"],
 )
 
-# 创建 DataLoader
 train_loader = DataLoader(
     tokenized_ds,
     batch_size=BATCH_SIZE,
@@ -89,118 +86,57 @@ train_loader = DataLoader(
 )
 
 # ----------------------------
-# 蒸馏训练
+# 优化器（CPU 兼容）
 # ----------------------------
-optimizer = torch.optim.AdamW(student_model.parameters(), lr=LEARNING_RATE)
+if device.type == "cuda":
+    optimizer = bnb.optim.AdamW8bit(student_model.parameters(), lr=LEARNING_RATE)
+else:
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=LEARNING_RATE)  # CPU 标准优化器
+
 kl_loss_fn = torch.nn.KLDivLoss(reduction="batchmean")
 ce_loss_fn = torch.nn.CrossEntropyLoss()
 
-print("\n🚀 Starting Knowledge Distillation Training...\n")
+# ----------------------------
+# 训练循环
+# ----------------------------
+print(f"\n🚀 Starting Distillation on CPU (16GB RAM)...")
+print(f"Dataset size: {len(tokenized_ds)} examples")
+print(f"Batch size: {BATCH_SIZE}, Max length: {MAX_LENGTH}, Epochs: {EPOCHS}")
 
-for epoch in range(EPOCHS):  # ✅ 修复：原错误行已修正
+for epoch in range(EPOCHS):
     total_loss = 0.0
     student_model.train()
-    for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")):
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
 
-        # Teacher logits (no grad)
         with torch.no_grad():
-            teacher_outputs = teacher_model(input_ids=input_ids, attention_mask=attention_mask)
-            teacher_logits = teacher_outputs.logits
+            teacher_logits = teacher_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        # Student logits
-        student_outputs = student_model(input_ids=input_ids, attention_mask=attention_mask)
-        student_logits = student_outputs.logits
+        student_logits = student_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        # Shift for causal LM
-        shift_teacher_logits = teacher_logits[..., :-1, :].contiguous()
-        shift_student_logits = student_logits[..., :-1, :].contiguous()
+        # Shift logits and labels
+        shift_t = teacher_logits[..., :-1, :].contiguous()
+        shift_s = student_logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
 
-        # Soft targets
-        soft_targets = torch.softmax(shift_teacher_logits / TEMPERATURE, dim=-1)
-        soft_probs = torch.log_softmax(shift_student_logits / TEMPERATURE, dim=-1)
-
-        # KL Loss (蒸馏损失)
+        # Losses
+        soft_targets = torch.softmax(shift_t / TEMPERATURE, dim=-1)
+        soft_probs = torch.log_softmax(shift_s / TEMPERATURE, dim=-1)
         kl_loss = kl_loss_fn(soft_probs, soft_targets) * (TEMPERATURE ** 2)
-
-        # Hard Loss (标准交叉熵)
-        ce_loss = ce_loss_fn(
-            shift_student_logits.view(-1, shift_student_logits.size(-1)),
-            shift_labels.view(-1)
-        )
-
-        # Total loss
+        ce_loss = ce_loss_fn(shift_s.view(-1, shift_s.size(-1)), shift_labels.view(-1))
         loss = ALPHA * kl_loss + (1 - ALPHA) * ce_loss
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
 
-    avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch+1} | Avg Loss: {avg_loss:.4f}")
+    print(f"Epoch {epoch+1} | Avg Loss: {total_loss / len(train_loader):.4f}")
 
 # ----------------------------
-# 保存蒸馏后的 student 模型
+# 保存模型
 # ----------------------------
-student_output_dir = os.path.join(DATA_DIR, "distilled_student")
-student_model.save_pretrained(student_output_dir)
-tokenizer.save_pretrained(student_output_dir)
-print(f"\n✅ Distilled student model saved to: {student_output_dir}")
-
-# ----------------------------
-# 评估：大小、准确度（Perplexity）、推理速度
-# ----------------------------
-print("\n🔍 Evaluating distilled student model...")
-
-# 1. 模型大小（参数量）
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-num_params = count_parameters(student_model)
-print(f"✅ Trainable Parameters: {num_params:,} (~{num_params / 1e6:.1f}M)")
-
-# 2. Perplexity on same dataset
-student_model.eval()
-total_ppl = 0.0
-count = 0
-
-with torch.no_grad():
-    for batch in tqdm(train_loader, desc="Computing Perplexity"):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-
-        outputs = student_model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
-        lm_loss = outputs.loss
-        if not torch.isnan(lm_loss):
-            ppl = math.exp(lm_loss.item())
-            total_ppl += ppl
-            count += 1
-
-avg_ppl = total_ppl / count if count > 0 else float('nan')
-print(f"✅ Average Perplexity on wikitext2_test200: {avg_ppl:.2f}")
-
-# 3. 推理速度（tokens/sec）
-prompt = "The quick brown fox jumps over the lazy dog."
-inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-# Warm-up
-for _ in range(2):
-    _ = student_model.generate(**inputs, max_new_tokens=10)
-
-start_time = time.time()
-outputs = student_model.generate(**inputs, max_new_tokens=50)
-end_time = time.time()
-
-generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-tokens_generated = len(tokenizer(generated_text)["input_ids"])
-latency = end_time - start_time
-throughput = tokens_generated / latency
-
-print(f"✅ Inference Speed: {throughput:.2f} tokens/sec")
-print(f"✅ Sample Output: {generated_text[:100]}...")
-
-print("\n🎉 Distillation and evaluation completed successfully!")
+student_model.save_pretrained("./distilled_student_cpu")  # 已是 float32
+tokenizer.save_pretrained("./distilled_student_cpu")
+print("✅ Saved distilled model locally!")

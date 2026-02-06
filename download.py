@@ -36,10 +36,13 @@ train_ds = train_ds.filter(lambda x: len(x["text"].strip()) > 20)  # 过滤太�
 train_ds.save_to_disk(os.path.join(DATA_DIR, "wikitext2_train200"))
 print("✅ Train dataset cached.")
 
-print("\n3. Downloading and caching TEST dataset (test[:200])...")
+print("\n3. Downloading and caching TEST dataset (test[:200]) as JSON...")
 test_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test[:200]")
 test_ds = test_ds.filter(lambda x: len(x["text"].strip()) > 10)
-test_ds.save_to_disk(os.path.join(DATA_DIR, "wikitext2_test200"))
-print("✅ Test dataset cached.")
+
+# 👇 关键：保存为 JSON 文件（不是 save_to_disk！）
+json_path = os.path.join(DATA_DIR, "wikitext2_test200.json")
+test_ds.to_json(json_path)
+print(f"✅ Test dataset cached as JSON: {json_path}")
 
 print("\n🎉 All assets cached locally! You can now run offline experiments.")

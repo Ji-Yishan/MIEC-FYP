@@ -1,5 +1,7 @@
-# 微调bert教师模型
-
+"""
+fine-tuning teacher model code, a updated to python 3.12 version of the reference paper's code
+referece code: https://github.com/lancopku/DynamicKD
+"""
 import logging
 import os
 import random
@@ -166,8 +168,7 @@ class ModelArguments:
 
 def sanitize_quotes(example, text_columns):
     """
-    检查指定文本列中的双引号 (") 和单引号 (') 是否成对出现。
-    如果不成对（数量为奇数），则移除该列中所有的该类引号，以防止 TSV/CSV 解析错位。
+    sanitize dataset, removing unbalance quotations
     """
     for col in text_columns:
         if col in example and example[col] is not None:
@@ -308,8 +309,6 @@ def main():
             else:
                 raise
         if not is_regression:
-            # 获取标签列表 (对于分类任务)
-            # 注意：glue 数据集的 label 通常是 ClassLabel 类型，直接取 names 即可
             label_feature = datasets["train"].features["label"]
             if hasattr(label_feature, "names") and label_feature.names is not None:
                 label_list = label_feature.names
@@ -318,25 +317,21 @@ def main():
                 label_list = sorted([str(label) for label in unique_labels if label is not None])
             num_labels = len(label_list)
         else:
-            # 回归任务只有一个输出值
             num_labels = 1
     else:
-        # 只有当 task_name 为 None 时，才从本地文件加载
+        # load from local when task name is none
         logger.info("Loading dataset from local files.")
         data_files = {"train": data_args.train_file, "validation": data_args.validation_file}
-        
-        # 自动判断文件扩展名
+
         file_extension = data_args.train_file.split('.')[-1]
         loader_args = {"data_files": data_files}
         
         if file_extension == "tsv":
             loader_args["delimiter"] = "\t"
-        
-        # 根据扩展名选择加载器 (csv/tsv 用 csv 加载器，json 用 json 加载器)
+
         datasets = load_dataset("csv" if file_extension in ["csv", "tsv"] else "json", **loader_args)
         
         if not is_regression:
-            # 本地数据需要手动提取唯一标签并排序
             unique_labels = datasets["train"].unique("label")
             label_list = sorted([str(label) for label in unique_labels if label is not None])
             num_labels = len(label_list)
@@ -347,10 +342,7 @@ def main():
     logger.info(f"Number of labels: {num_labels}")
     if label_list:
         logger.info(f"Label list: {label_list}")
-    
-    # ==============================================
-    # 🛡️ NEW: Sanitize Quotes to Prevent Column Misalignment
-    # ==============================================
+
     logger.info("Checking and sanitizing unbalanced quotes in dataset...")
     sentence1_key, sentence2_key = task_to_keys.get(data_args.task_name, ("sentence1", "sentence2"))
     if data_args.task_name not in task_to_keys:

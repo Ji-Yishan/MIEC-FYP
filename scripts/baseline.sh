@@ -13,7 +13,7 @@ VALID_FILE="${VALID_FILE:-./RTE/dev.tsv}"
 OUT_DIR="${OUT_DIR:-./ckpts/mb_rte_local}"
 TEACHER="${TEACHER:-./ckpts/rte-bert-base-uncased}"
 
-python mb.py \
+python baseline.py \
   --model_name_or_path "bert-base-uncased" \
   --teacher "${TEACHER}" \
   --task_name rte \

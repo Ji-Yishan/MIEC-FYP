@@ -16,7 +16,7 @@ fi
 
 STRATEGY="${STRATEGY:-${OBJECTIVE_STRATEGY:-uncertainty}}"
 # innovation with attention, ce, kd, rep
-python p2.py \
+python innovation.py \
   --model_name_or_path "${STUDENT_MODEL:-bert-base-uncased}" \
   --teacher "${TEACHER:-./ckpts/rte-bert-base-uncased}" \
   --task_name rte \

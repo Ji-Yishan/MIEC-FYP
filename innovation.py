@@ -1,10 +1,6 @@
-
-# coding=utf-8
 """
-Clean Dynamic Objective KD runner extracted from prob2.py.
-
-This version only keeps the path used by scripts/innovate.sh for prob2:
-single-teacher Dynamic Objective KD on sequence classification tasks.
+Proposed Tri-LossKD method implementation, adding innovation base on the baseline.py
+uses dynamic weighing strategy to calculate loss base on ce, kl, rep and atten losses
 """
 
 from __future__ import annotations

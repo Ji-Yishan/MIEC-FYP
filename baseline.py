@@ -1,9 +1,6 @@
-# coding=utf-8
 """
-Minimal dynamic_objective baseline extracted from myBaseLine.py.
-
-Activated path only:
-  - dynamic_variant=dynamic_objective
+My baseline method, a updated to python 3.12 version of below reference paper's dynamic objective method code
+reference code address: https://github.com/lancopku/DynamicKD
 """
 
 from __future__ import annotations

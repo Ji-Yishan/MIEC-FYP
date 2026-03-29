@@ -4,12 +4,14 @@ import logging
 import os
 import random
 import sys
+import inspect
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
 
 import numpy as np
-from datasets import load_dataset, load_metric, Features, Value, ClassLabel
+from datasets import load_dataset, Features, Value, ClassLabel
+import torch
 
 import transformers
 from transformers import (
@@ -26,6 +28,13 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from runtime_compat import (
+    apply_safe_training_defaults,
+    configure_mps_for_mac,
+    current_device,
+    load_glue_metric,
+    safe_random_indices,
+)
 
 
 # A list of all GLUE tasks
@@ -204,12 +213,15 @@ def load_local_rte_from_repo_root():
 
 
 def main():
+    configure_mps_for_mac(ram_limit_gb=48)
     # Parse arguments
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    applied_runtime = apply_safe_training_defaults(training_args, for_mps=True)
 
     # TensorBoard integration can fail in legacy Python/protobuf environments.
     # Fallback to no external reporting instead of crashing at Trainer init.
@@ -219,6 +231,12 @@ def main():
         except Exception:
             logger.warning("TensorBoard is unavailable/incompatible; disabling `report_to=tensorboard`.")
             training_args.report_to = []
+
+    if training_args.do_train and training_args.do_eval:
+        if hasattr(training_args, "eval_strategy"):
+            training_args.eval_strategy = "epoch"
+        if hasattr(training_args, "evaluation_strategy"):
+            training_args.evaluation_strategy = "epoch"
 
     # Setup logging
     logging.basicConfig(
@@ -234,6 +252,9 @@ def main():
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    if applied_runtime:
+        logger.info(f"Applied safe runtime defaults: {applied_runtime}")
+    logger.info(f"Torch device: {current_device()}")
 
     # Set the verbosity of the Transformers logger
     if is_main_process(training_args.local_rank):
@@ -243,7 +264,12 @@ def main():
 
     # Detect last checkpoint
     last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+    overwrite_output_dir = getattr(training_args, "overwrite_output_dir", False)
+    if (
+        os.path.isdir(training_args.output_dir)
+        and training_args.do_train
+        and not overwrite_output_dir
+    ):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
@@ -326,7 +352,16 @@ def main():
     # 🛡️ NEW: Sanitize Quotes to Prevent Column Misalignment
     # ==============================================
     logger.info("Checking and sanitizing unbalanced quotes in dataset...")
-    sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
+    sentence1_key, sentence2_key = task_to_keys.get(data_args.task_name, ("sentence1", "sentence2"))
+    if data_args.task_name not in task_to_keys:
+        available_cols = datasets["train"].column_names
+        if "sentence1" in available_cols:
+            sentence1_key, sentence2_key = "sentence1", "sentence2"
+        elif "text" in available_cols:
+            sentence1_key, sentence2_key = "text", None
+        else:
+            sentence1_key = available_cols[0]
+            sentence2_key = available_cols[1] if len(available_cols) > 2 else None
     text_columns_to_check = [sentence1_key]
     if sentence2_key:
         text_columns_to_check.append(sentence2_key)
@@ -350,14 +385,14 @@ def main():
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
     model = AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
@@ -365,7 +400,7 @@ def main():
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
 
     # Preprocessing the datasets
@@ -404,6 +439,11 @@ def main():
     train_dataset = datasets["train"]
     eval_dataset = datasets["validation"]
 
+    if training_args.do_train and "label" in train_dataset.column_names:
+        train_dataset = train_dataset.filter(lambda x: x["label"] != -1, desc="Filtering invalid training labels")
+    if training_args.do_eval and "label" in eval_dataset.column_names:
+        eval_dataset = eval_dataset.filter(lambda x: x["label"] != -1, desc="Filtering invalid validation labels")
+
     if data_args.max_train_samples is not None:
         train_dataset = train_dataset.select(range(data_args.max_train_samples))
     if data_args.max_val_samples is not None:
@@ -411,11 +451,11 @@ def main():
 
     # Log a few random samples
     if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
+        for index in safe_random_indices(len(train_dataset), 3):
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # Get the metric function
-    metric = load_metric("glue", data_args.task_name) if data_args.task_name in glue_tasks else None
+    metric = load_glue_metric(data_args.task_name) if data_args.task_name in glue_tasks else None
 
     def compute_metrics(p: EvalPrediction):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
@@ -438,15 +478,21 @@ def main():
     )
 
     # Initialize Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset if training_args.do_train else None,
+        "eval_dataset": eval_dataset if training_args.do_eval else None,
+        "compute_metrics": compute_metrics,
+        "data_collator": data_collator,
+    }
+    trainer_init_params = inspect.signature(Trainer.__init__).parameters
+    if "tokenizer" in trainer_init_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_init_params:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
 
     # Training
     if training_args.do_train:

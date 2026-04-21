@@ -1,6 +1,9 @@
+# coding=utf-8
 """
-My baseline method, a updated to python 3.12 version of below reference paper's dynamic objective method code
-reference code address: https://github.com/lancopku/DynamicKD
+Minimal dynamic_objective baseline extracted from myBaseLine.py.
+
+Activated path only:
+  - dynamic_variant=dynamic_objective
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,6 +67,44 @@ task_to_keys = {
 }
 
 
+def _clear_training_outputs(training_args):
+    overwrite_od = getattr(training_args, "overwrite_output_dir", False)
+    if not (training_args.do_train and overwrite_od and os.path.isdir(training_args.output_dir)):
+        return
+
+    output_dir = Path(training_args.output_dir)
+    removed = []
+
+    for checkpoint_dir in sorted(output_dir.glob("checkpoint-*")):
+        if checkpoint_dir.is_dir():
+            shutil.rmtree(checkpoint_dir)
+            removed.append(checkpoint_dir.name)
+
+    for pattern in (
+        "trainer_state.json",
+        "train_results.json",
+        "all_results.json",
+        "myBaseLine_results.json",
+        "test_results_*.txt",
+    ):
+        for artifact in sorted(output_dir.glob(pattern)):
+            if artifact.is_file():
+                artifact.unlink()
+                removed.append(artifact.name)
+
+    if removed:
+        logger.info(
+            "overwrite_output_dir=True: cleared %s existing training artifacts from %s",
+            len(removed),
+            training_args.output_dir,
+        )
+    else:
+        logger.info(
+            "overwrite_output_dir=True: no prior training artifacts found in %s; starting fresh run",
+            training_args.output_dir,
+        )
+
+
 class DynamicObjectiveKDForSequenceClassification(BertForSequenceClassification):
     def __init__(
         self,
@@ -88,6 +130,31 @@ class DynamicObjectiveKDForSequenceClassification(BertForSequenceClassification)
         self.strategy = strategy
         self.ds_weight = 1.0
         self.pt_weight = 1.0
+        self.teacher_rep_proj = nn.Identity()
+
+        if teacher is not None:
+            self.set_teacher(teacher)
+
+    def set_teacher(self, teacher):
+        self.teacher = teacher
+        teacher_hidden_size = teacher.config.hidden_size
+        student_hidden_size = self.config.hidden_size
+
+        if teacher_hidden_size != student_hidden_size:
+            self.teacher_rep_proj = nn.Linear(teacher_hidden_size, student_hidden_size)
+            logger.info(
+                "Representation KD projection enabled: teacher hidden size %s -> student hidden size %s",
+                teacher_hidden_size,
+                student_hidden_size,
+            )
+        else:
+            self.teacher_rep_proj = nn.Identity()
+            logger.info(
+                "Representation KD projection disabled: teacher and student hidden size both %s",
+                student_hidden_size,
+            )
+
+        return self
 
     def forward(
         self,
@@ -147,12 +214,13 @@ class DynamicObjectiveKDForSequenceClassification(BertForSequenceClassification)
             if self.kd_rep_alpha > 0 and self.strategy == "none":
                 for student_rep, teacher_rep in zip(new_student_reps, new_teacher_reps):
                     tmp_loss = F.mse_loss(
-                        F.normalize(student_rep, p=2, dim=1), F.normalize(teacher_rep, p=2, dim=1)
+                        F.normalize(student_rep, p=2, dim=1),
+                        F.normalize(self.teacher_rep_proj(teacher_rep), p=2, dim=1),
                     )
                     rep_loss += tmp_loss
             elif self.kd_rep_alpha > 0 and "uncertainty" in self.strategy:
                 new_student_reps_t = torch.stack(new_student_reps, dim=1)
-                new_teacher_reps_t = torch.stack(new_teacher_reps, dim=1)
+                new_teacher_reps_t = self.teacher_rep_proj(torch.stack(new_teacher_reps, dim=1))
                 rep_loss = (
                     F.mse_loss(
                         F.normalize(new_student_reps_t, p=2, dim=-1),
@@ -308,6 +376,14 @@ class DataTrainingArguments:
 
 
 @dataclass
+class MBTrainingArguments(TrainingArguments):
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={"help": "Clear prior training artifacts in output_dir before starting a new run."},
+    )
+
+
+@dataclass
 class MBModelArguments:
     model_name_or_path: str = field(metadata={"help": "Student checkpoint or HF id (BERT)."})
     teacher: str = field(metadata={"help": "Teacher checkpoint or HF id."})
@@ -335,7 +411,7 @@ def _token_kw(model_args):
 
 def main():
     configure_mps_for_mac(ram_limit_gb=48)
-    parser = HfArgumentParser((MBModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((MBModelArguments, DataTrainingArguments, MBTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
@@ -371,6 +447,7 @@ def main():
 
     last_checkpoint = None
     overwrite_od = getattr(training_args, "overwrite_output_dir", False)
+    _clear_training_outputs(training_args)
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not overwrite_od:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
@@ -486,7 +563,7 @@ def main():
         kd_rep_alpha=model_args.kd_rep_alpha,
         strategy=model_args.objective_strategy,
     )
-    model.teacher = teacher_model
+    model.set_teacher(teacher_model)
     callbacks = [ObjectiveWeightLoggingCallback(model)]
 
     if data_args.task_name is not None:

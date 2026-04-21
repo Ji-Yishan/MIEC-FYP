@@ -1,6 +1,10 @@
+
+# coding=utf-8
 """
-Proposed Tri-LossKD method implementation, adding innovation base on the baseline.py
-uses dynamic weighing strategy to calculate loss base on ce, kl, rep and atten losses
+Clean Dynamic Objective KD runner extracted from prob2.py.
+
+This version only keeps the path used by scripts/innovate.sh for prob2:
+single-teacher Dynamic Objective KD on sequence classification tasks.
 """
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +79,31 @@ class DynamicObjectiveKDForSequenceClassification(BertForSequenceClassification)
         self.strategy = strategy
         self.ds_weight = 1.0
         self.pt_weight = 1.0
+        self.teacher_rep_proj = nn.Identity()
+
+        if teacher is not None:
+            self.set_teacher(teacher)
+
+    def set_teacher(self, teacher):
+        self.teacher = teacher
+        teacher_hidden_size = teacher.config.hidden_size
+        student_hidden_size = self.config.hidden_size
+
+        if teacher_hidden_size != student_hidden_size:
+            self.teacher_rep_proj = nn.Linear(teacher_hidden_size, student_hidden_size)
+            logger.info(
+                "Representation KD projection enabled: teacher hidden size %s -> student hidden size %s",
+                teacher_hidden_size,
+                student_hidden_size,
+            )
+        else:
+            self.teacher_rep_proj = nn.Identity()
+            logger.info(
+                "Representation KD projection disabled: teacher and student hidden size both %s",
+                student_hidden_size,
+            )
+
+        return self
 
     def forward(
         self,
@@ -160,11 +190,11 @@ class DynamicObjectiveKDForSequenceClassification(BertForSequenceClassification)
                 for student_rep, teacher_rep in zip(new_student_reps, new_teacher_reps):
                     rep_loss += F.mse_loss(
                         F.normalize(student_rep, p=2, dim=1),
-                        F.normalize(teacher_rep, p=2, dim=1),
+                        F.normalize(self.teacher_rep_proj(teacher_rep), p=2, dim=1),
                     )
             elif (self.kd_rep_alpha > 0 or self.attn_alpha > 0) and "uncertainty" in self.strategy:
                 new_student_reps_t = torch.stack(new_student_reps, dim=1)
-                new_teacher_reps_t = torch.stack(new_teacher_reps, dim=1)
+                new_teacher_reps_t = self.teacher_rep_proj(torch.stack(new_teacher_reps, dim=1))
                 rep_loss = (
                     F.mse_loss(
                         F.normalize(new_student_reps_t, p=2, dim=-1),
@@ -340,6 +370,14 @@ class DataTrainingArguments:
 
 
 @dataclass
+class P2TrainingArguments(TrainingArguments):
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={"help": "Clear prior training artifacts in output_dir before starting a new run."},
+    )
+
+
+@dataclass
 class ModelArguments:
     model_name_or_path: str = field(metadata={"help": "Student checkpoint or HF id (BERT)."})
     teacher: str = field(metadata={"help": "Teacher checkpoint or HF id."})
@@ -369,7 +407,7 @@ def _token_kw(model_args):
 
 
 def _parse_args():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, P2TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         return parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     return parser.parse_args_into_dataclasses()
@@ -420,6 +458,44 @@ def _resolve_last_checkpoint(training_args):
         if last_checkpoint is not None:
             logger.info("Resuming from %s", last_checkpoint)
     return last_checkpoint
+
+
+def _clear_training_outputs(training_args):
+    overwrite_od = getattr(training_args, "overwrite_output_dir", False)
+    if not (training_args.do_train and overwrite_od and os.path.isdir(training_args.output_dir)):
+        return
+
+    output_dir = Path(training_args.output_dir)
+    removed = []
+
+    for checkpoint_dir in sorted(output_dir.glob("checkpoint-*")):
+        if checkpoint_dir.is_dir():
+            shutil.rmtree(checkpoint_dir)
+            removed.append(checkpoint_dir.name)
+
+    for pattern in (
+        "trainer_state.json",
+        "train_results.json",
+        "all_results.json",
+        "myBaseLine_results.json",
+        "test_results_*.txt",
+    ):
+        for artifact in sorted(output_dir.glob(pattern)):
+            if artifact.is_file():
+                artifact.unlink()
+                removed.append(artifact.name)
+
+    if removed:
+        logger.info(
+            "overwrite_output_dir=True: cleared %s existing training artifacts from %s",
+            len(removed),
+            training_args.output_dir,
+        )
+    else:
+        logger.info(
+            "overwrite_output_dir=True: no prior training artifacts found in %s; starting fresh run",
+            training_args.output_dir,
+        )
 
 
 def _load_datasets(model_args, data_args, training_args):
@@ -535,7 +611,7 @@ def _build_model(model_args, data_args, num_labels, tok):
         attn_alpha=model_args.attn_alpha,
         strategy=model_args.objective_strategy,
     )
-    model.teacher = teacher_model
+    model.set_teacher(teacher_model)
     return model
 
 
@@ -671,6 +747,7 @@ def main():
     model_args, data_args, training_args = _parse_args()
     applied = _configure_training(training_args)
     _configure_logging(training_args)
+    _clear_training_outputs(training_args)
     last_checkpoint = _resolve_last_checkpoint(training_args)
     set_seed(training_args.seed)
     tok = _token_kw(model_args)
